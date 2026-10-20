@@ -12,6 +12,13 @@ class Tests_Option_Transient extends WP_UnitTestCase {
 	 */
 	private $suppress_errors = null;
 
+	/**
+	 * Previous external object cache flag, restored after a test that simulates one.
+	 *
+	 * @var bool|null
+	 */
+	private $had_external_object_cache = null;
+
 	public function set_up() {
 		parent::set_up();
 
@@ -24,6 +31,11 @@ class Tests_Option_Transient extends WP_UnitTestCase {
 		if ( null !== $this->suppress_errors ) {
 			$GLOBALS['wpdb']->suppress_errors( $this->suppress_errors );
 			$this->suppress_errors = null;
+		}
+
+		if ( null !== $this->had_external_object_cache ) {
+			wp_using_ext_object_cache( $this->had_external_object_cache );
+			$this->had_external_object_cache = null;
 		}
 
 		parent::tear_down();
@@ -417,5 +429,190 @@ class Tests_Option_Transient extends WP_UnitTestCase {
 			return $query;
 		};
 		add_filter( 'query', $filter );
+	}
+
+	/**
+	 * Tests that an expiring transient writes a non-autoloaded timeout row and value row on the database path.
+	 *
+	 * @ticket 52345
+	 *
+	 * @covers ::set_transient
+	 */
+	public function test_set_transient_should_write_timeout_and_value_rows_without_autoload() {
+		$key = 'transient_rows_with_expiry';
+
+		$this->assertTrue( set_transient( $key, 'value', 60 ), 'set_transient() should succeed.' );
+		$this->assertSame( 'value', get_transient( $key ), 'The value should be returned.' );
+		$this->assertSame( 2, $this->count_option_rows( "_transient%{$key}" ), 'Both the value and timeout rows should exist.' );
+
+		$alloptions = wp_load_alloptions( true );
+		$this->assertArrayNotHasKey( "_transient_{$key}", $alloptions, 'An expiring transient value should not be autoloaded.' );
+		$this->assertArrayNotHasKey( "_transient_timeout_{$key}", $alloptions, 'A transient timeout should not be autoloaded.' );
+	}
+
+	/**
+	 * Tests that a transient without an expiry still writes only an autoloaded value row.
+	 *
+	 * @ticket 52345
+	 *
+	 * @covers ::set_transient
+	 */
+	public function test_set_transient_without_expiration_should_not_write_a_timeout_row() {
+		$key = 'transient_rows_without_expiry';
+
+		$this->assertTrue( set_transient( $key, 'value' ), 'set_transient() should succeed.' );
+		$this->assertSame( 'value', get_transient( $key ), 'The value should be returned.' );
+		$this->assertSame( 1, $this->count_option_rows( "_transient%{$key}" ), 'Only the value row should exist.' );
+		$this->assertFalse( get_option( "_transient_timeout_{$key}" ), 'No timeout row should be written.' );
+		$this->assertArrayHasKey( "_transient_{$key}", wp_load_alloptions( true ), 'A non-expiring transient value should be autoloaded.' );
+	}
+
+	/**
+	 * Tests that an expiry can be added to an existing transient that has no timeout row.
+	 *
+	 * @ticket 52345
+	 *
+	 * @covers ::set_transient
+	 */
+	public function test_set_transient_should_add_timeout_to_existing_transient_without_one() {
+		$key = 'transient_add_expiry';
+		set_transient( $key, 'old' );
+
+		$this->assertTrue( set_transient( $key, 'new', 60 ), 'set_transient() should succeed.' );
+		$this->assertSame( 'new', get_transient( $key ), 'The new value should be returned.' );
+		$this->assertNotFalse( get_option( "_transient_timeout_{$key}" ), 'A timeout row should now exist.' );
+		$this->assertArrayNotHasKey( "_transient_{$key}", wp_load_alloptions( true ), 'The value should no longer be autoloaded.' );
+	}
+
+	/**
+	 * Tests that a failure to store the value row is still reported once the timeout row was written.
+	 *
+	 * @ticket 52345
+	 *
+	 * @covers ::set_transient
+	 */
+	public function test_set_transient_should_return_false_when_value_cannot_be_added() {
+		$key    = 'transient_value_fails';
+		$action = new MockAction();
+		add_action( "set_transient_{$key}", array( $action, 'action' ) );
+		$this->fail_insert_of_option( "_transient_{$key}" );
+
+		$this->assertFalse( set_transient( $key, 'value', 60 ), 'set_transient() should report the failure.' );
+		$this->assertFalse( get_transient( $key ), 'No value should be readable.' );
+		$this->assertSame( 0, $action->get_call_count(), 'The set_transient_{$transient} action should not fire.' );
+	}
+
+	/**
+	 * Tests that an earlier, unrelated database error does not stop a transient being set over an orphaned timeout.
+	 *
+	 * The error left in `$wpdb->last_error` must not be mistaken for a failure of the timeout insert.
+	 *
+	 * @ticket 52345
+	 *
+	 * @covers ::set_transient
+	 */
+	public function test_set_transient_should_store_value_over_orphaned_timeout_after_an_unrelated_database_error() {
+		global $wpdb;
+
+		$key = 'transient_orphan_stale_error';
+		set_transient( $key, 'old', 60 );
+		delete_option( "_transient_{$key}" );
+
+		$this->suppress_errors = $wpdb->suppress_errors( true );
+		$wpdb->query( "SELECT 1 FROM {$wpdb->options}_missing" ); // phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- Deliberately invalid query.
+		$this->assertNotSame( '', $wpdb->last_error, 'The unrelated query should have left an error behind.' );
+
+		$this->assertTrue( set_transient( $key, 'new', 60 ), 'set_transient() should succeed.' );
+		$this->assertSame( 'new', get_transient( $key ), 'The new value should be returned.' );
+	}
+
+	/**
+	 * Tests that, with an external object cache, transients use the cache only and never touch the options table.
+	 *
+	 * The external cache is simulated by flagging the default in-memory cache as external. It is not a real
+	 * Redis or Memcached drop-in.
+	 *
+	 * @ticket 52345
+	 *
+	 * @dataProvider data_expirations
+	 *
+	 * @covers ::set_transient
+	 * @covers ::get_transient
+	 * @covers ::delete_transient
+	 *
+	 * @param int $expiration Expiration in seconds.
+	 */
+	public function test_transients_should_use_only_the_object_cache_with_an_external_object_cache( $expiration ) {
+		$key = 'transient_external_cache';
+		$this->use_simulated_external_object_cache();
+		// A failing timeout insert must be irrelevant, as no timeout row is ever written.
+		$this->fail_insert_of_option( "_transient_timeout_{$key}" );
+		$queries = $this->record_queries();
+
+		$this->assertTrue( set_transient( $key, 'first', $expiration ), 'The first set should succeed.' );
+		$this->assertTrue( set_transient( $key, 'second', $expiration ), 'Setting again should succeed.' );
+		$this->assertSame( 'second', get_transient( $key ), 'The value should come from the object cache.' );
+		$this->assertSame( 'second', wp_cache_get( $key, 'transient' ), 'The value should be in the transient cache group.' );
+		$this->assertTrue( delete_transient( $key ), 'The transient should be deleted.' );
+		$this->assertFalse( get_transient( $key ), 'The transient should be gone.' );
+
+		// Check the recorded queries before this test runs any of its own.
+		$this->assertSame( array(), preg_grep( '/' . preg_quote( $key, '/' ) . '/', $queries->queries ), 'No query should mention the transient.' );
+
+		$this->assertFalse( get_option( "_transient_{$key}" ), 'No value row should exist.' );
+		$this->assertFalse( get_option( "_transient_timeout_{$key}" ), 'No timeout row should exist.' );
+		$this->assertSame( 0, $this->count_option_rows( "%{$key}%" ), 'Neither setting nor deleting should write option rows.' );
+	}
+
+	/**
+	 * Data provider for expiry values.
+	 *
+	 * @return array[]
+	 */
+	public function data_expirations() {
+		return array(
+			'with an expiry'    => array( 60 ),
+			'without an expiry' => array( 0 ),
+		);
+	}
+
+	/**
+	 * Counts rows in the options table whose name matches a LIKE pattern.
+	 *
+	 * @param string $like LIKE pattern.
+	 * @return int Row count.
+	 */
+	private function count_option_rows( $like ) {
+		global $wpdb;
+
+		return (int) $wpdb->get_var(
+			$wpdb->prepare( "SELECT COUNT(*) FROM {$wpdb->options} WHERE option_name LIKE %s", $like )
+		);
+	}
+
+	/**
+	 * Flags the in-memory object cache as external for the rest of the test.
+	 */
+	private function use_simulated_external_object_cache() {
+		$this->had_external_object_cache = wp_using_ext_object_cache( true );
+		wp_cache_flush();
+	}
+
+	/**
+	 * Starts recording every database query.
+	 *
+	 * @return object Object whose `queries` property collects the query strings.
+	 */
+	private function record_queries() {
+		$log          = new stdClass();
+		$log->queries = array();
+		add_filter(
+			'query',
+			static function ( $query ) use ( $log ) {
+				$log->queries[] = $query;
+				return $query;
+			}
+		);
+		return $log;
 	}
 }

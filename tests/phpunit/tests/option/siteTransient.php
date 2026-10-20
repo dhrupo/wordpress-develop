@@ -12,6 +12,13 @@ class Tests_Option_SiteTransient extends WP_UnitTestCase {
 	 */
 	private $suppress_errors = null;
 
+	/**
+	 * Previous external object cache flag, restored after a test that simulates one.
+	 *
+	 * @var bool|null
+	 */
+	private $had_external_object_cache = null;
+
 	public function set_up() {
 		parent::set_up();
 
@@ -24,6 +31,11 @@ class Tests_Option_SiteTransient extends WP_UnitTestCase {
 		if ( null !== $this->suppress_errors ) {
 			$GLOBALS['wpdb']->suppress_errors( $this->suppress_errors );
 			$this->suppress_errors = null;
+		}
+
+		if ( null !== $this->had_external_object_cache ) {
+			wp_using_ext_object_cache( $this->had_external_object_cache );
+			$this->had_external_object_cache = null;
 		}
 
 		parent::tear_down();
@@ -258,5 +270,154 @@ class Tests_Option_SiteTransient extends WP_UnitTestCase {
 				return $query;
 			}
 		);
+	}
+
+	/**
+	 * Tests that an expiring site transient writes a timeout row and a value row on the database path.
+	 *
+	 * @ticket 52345
+	 *
+	 * @covers ::set_site_transient
+	 */
+	public function test_set_site_transient_should_write_timeout_and_value_rows() {
+		$key = 'site_transient_rows_with_expiry';
+
+		$this->assertTrue( set_site_transient( $key, 'value', 60 ), 'set_site_transient() should succeed.' );
+		$this->assertSame( 'value', get_site_transient( $key ), 'The value should be returned.' );
+		$this->assertSame( 2, $this->count_site_option_rows( "_site_transient%{$key}" ), 'Both the value and timeout rows should exist.' );
+		$this->assertNotFalse( get_site_option( "_site_transient_timeout_{$key}" ), 'The timeout row should be readable.' );
+	}
+
+	/**
+	 * Tests that a site transient without an expiry writes no timeout row.
+	 *
+	 * @ticket 52345
+	 *
+	 * @covers ::set_site_transient
+	 */
+	public function test_set_site_transient_without_expiration_should_not_write_a_timeout_row() {
+		$key = 'site_transient_rows_without_expiry';
+
+		$this->assertTrue( set_site_transient( $key, 'value' ), 'set_site_transient() should succeed.' );
+		$this->assertSame( 'value', get_site_transient( $key ), 'The value should be returned.' );
+		$this->assertSame( 1, $this->count_site_option_rows( "_site_transient%{$key}" ), 'Only the value row should exist.' );
+		$this->assertFalse( get_site_option( "_site_transient_timeout_{$key}" ), 'No timeout row should be written.' );
+	}
+
+	/**
+	 * Tests that a failure to store the value row is still reported once the timeout row was written.
+	 *
+	 * @ticket 52345
+	 *
+	 * @covers ::set_site_transient
+	 */
+	public function test_set_site_transient_should_return_false_when_value_cannot_be_added() {
+		$key    = 'site_transient_value_fails';
+		$action = new MockAction();
+		add_action( "set_site_transient_{$key}", array( $action, 'action' ) );
+		$this->fail_insert_of_site_option( "_site_transient_{$key}" );
+
+		$this->assertFalse( set_site_transient( $key, 'value', 60 ), 'set_site_transient() should report the failure.' );
+		$this->assertFalse( get_site_transient( $key ), 'No value should be readable.' );
+		$this->assertSame( 0, $action->get_call_count(), 'The set_site_transient_{$transient} action should not fire.' );
+	}
+
+	/**
+	 * Tests that an earlier, unrelated database error does not stop a site transient being set over an orphaned timeout.
+	 *
+	 * @ticket 52345
+	 *
+	 * @covers ::set_site_transient
+	 */
+	public function test_set_site_transient_should_store_value_over_orphaned_timeout_after_an_unrelated_database_error() {
+		global $wpdb;
+
+		$key = 'site_transient_orphan_stale_error';
+		set_site_transient( $key, 'old', 60 );
+		delete_site_option( "_site_transient_{$key}" );
+
+		$this->suppress_errors = $wpdb->suppress_errors( true );
+		$wpdb->query( "SELECT 1 FROM {$wpdb->options}_missing" ); // phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- Deliberately invalid query.
+		$this->assertNotSame( '', $wpdb->last_error, 'The unrelated query should have left an error behind.' );
+
+		$this->assertTrue( set_site_transient( $key, 'new', 60 ), 'set_site_transient() should succeed.' );
+		$this->assertSame( 'new', get_site_transient( $key ), 'The new value should be returned.' );
+	}
+
+	/**
+	 * Tests that, with an external object cache, site transients use the cache only and write no rows.
+	 *
+	 * The external cache is simulated by flagging the default in-memory cache as external. It is not a real
+	 * Redis or Memcached drop-in.
+	 *
+	 * @ticket 52345
+	 *
+	 * @dataProvider data_expirations
+	 *
+	 * @covers ::set_site_transient
+	 * @covers ::get_site_transient
+	 * @covers ::delete_site_transient
+	 *
+	 * @param int $expiration Expiration in seconds.
+	 */
+	public function test_site_transients_should_use_only_the_object_cache_with_an_external_object_cache( $expiration ) {
+		$key                             = 'site_transient_external_cache';
+		$this->had_external_object_cache = wp_using_ext_object_cache( true );
+		wp_cache_flush();
+
+		// A failing timeout insert must be irrelevant, as no timeout row is ever written.
+		$this->fail_insert_of_site_option( "_site_transient_timeout_{$key}" );
+		$queries = array();
+		add_filter(
+			'query',
+			static function ( $query ) use ( &$queries ) {
+				$queries[] = $query;
+				return $query;
+			}
+		);
+
+		$this->assertTrue( set_site_transient( $key, 'first', $expiration ), 'The first set should succeed.' );
+		$this->assertTrue( set_site_transient( $key, 'second', $expiration ), 'Setting again should succeed.' );
+		$this->assertSame( 'second', get_site_transient( $key ), 'The value should come from the object cache.' );
+		$this->assertSame( 'second', wp_cache_get( $key, 'site-transient' ), 'The value should be in the site transient cache group.' );
+
+		$this->assertTrue( delete_site_transient( $key ), 'The site transient should be deleted.' );
+		$this->assertFalse( get_site_transient( $key ), 'The site transient should be gone.' );
+
+		// Check the recorded queries before this test runs any of its own.
+		$this->assertSame( array(), preg_grep( '/' . preg_quote( $key, '/' ) . '/', $queries ), 'No query should mention the site transient.' );
+		$this->assertSame( 0, $this->count_site_option_rows( "%{$key}%" ), 'Neither setting nor deleting should write rows.' );
+	}
+
+	/**
+	 * Data provider for expiry values.
+	 *
+	 * @return array[]
+	 */
+	public function data_expirations() {
+		return array(
+			'with an expiry'    => array( 60 ),
+			'without an expiry' => array( 0 ),
+		);
+	}
+
+	/**
+	 * Counts rows holding site options whose name matches a LIKE pattern.
+	 *
+	 * Site options live in the sitemeta table on multisite and in the options table otherwise.
+	 *
+	 * @param string $like LIKE pattern.
+	 * @return int Row count.
+	 */
+	private function count_site_option_rows( $like ) {
+		global $wpdb;
+
+		if ( is_multisite() ) {
+			$query = "SELECT COUNT(*) FROM {$wpdb->sitemeta} WHERE meta_key LIKE %s";
+		} else {
+			$query = "SELECT COUNT(*) FROM {$wpdb->options} WHERE option_name LIKE %s";
+		}
+
+		return (int) $wpdb->get_var( $wpdb->prepare( $query, $like ) ); // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared -- Table name only, value is prepared.
 	}
 }
