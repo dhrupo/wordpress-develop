@@ -53,7 +53,19 @@ final class WP_Secrets_Option_Store implements WP_Secrets_Store {
 		$value       = $network ? get_site_option( $option_name, null ) : get_option( $option_name, null );
 
 		if ( null === $value ) {
-			return null;
+			// The options API returns the default both when a record is absent and when
+			// its query failed, so read the row directly to tell those two apart.
+			$stored = $this->read_stored_record( $option_name, $network );
+
+			if ( is_wp_error( $stored ) ) {
+				return $stored;
+			}
+
+			if ( false === $stored ) {
+				return null;
+			}
+
+			$value = $stored;
 		}
 
 		if ( ! is_array( $value ) ) {
@@ -203,5 +215,54 @@ final class WP_Secrets_Option_Store implements WP_Secrets_Store {
 	 */
 	private function option_name( string $name, bool $network ): string {
 		return ( $network ? self::NETWORK_PREFIX : self::SITE_PREFIX ) . $name;
+	}
+
+	/**
+	 * Reads a secret's stored row directly, bypassing the options cache.
+	 *
+	 * Failure is taken from wpdb::query(), which returns false on every failed read
+	 * and a row count on every successful one. wpdb::$last_error cannot be used for
+	 * this: a lost connection returns before it is set, and the early returns for an
+	 * unready handle or an emptied `query` filter leave the previous query's value
+	 * in place.
+	 *
+	 * @since 7.2.0
+	 *
+	 * @global wpdb $wpdb WordPress database abstraction object.
+	 *
+	 * @param string $option_name The record's option name.
+	 * @param bool   $network     Whether this is a network-scope secret.
+	 * @return mixed|false|WP_Error The stored value, false if no row exists, or
+	 *                              WP_Error if the read failed.
+	 */
+	private function read_stored_record( string $option_name, bool $network ) {
+		global $wpdb;
+
+		if ( $network && is_multisite() ) {
+			$sql = $wpdb->prepare(
+				"SELECT meta_value AS record FROM {$wpdb->sitemeta} WHERE meta_key = %s AND site_id = %d LIMIT 1",
+				$option_name,
+				get_current_network_id()
+			);
+		} else {
+			$sql = $wpdb->prepare(
+				"SELECT option_value AS record FROM {$wpdb->options} WHERE option_name = %s LIMIT 1",
+				$option_name
+			);
+		}
+
+		// phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared -- $sql is prepared in both branches above.
+		if ( false === $wpdb->query( $sql ) ) {
+			return new WP_Error(
+				WP_SECRETS_ERROR_STORE_UNAVAILABLE,
+				__( 'The secret record could not be read.' )
+			);
+		}
+
+		if ( empty( $wpdb->last_result ) ) {
+			return false;
+		}
+
+		return maybe_unserialize( $wpdb->last_result[0]->record );
 	}
 }

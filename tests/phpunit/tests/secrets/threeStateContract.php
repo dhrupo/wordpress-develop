@@ -200,4 +200,77 @@ class Tests_Secrets_ThreeStateContract extends WP_UnitTestCase {
 		$this->assertNotWPError( $result );
 		$this->assertInstanceOf( WP_Secret::class, $result );
 	}
+
+	/**
+	 * @ticket 66424
+	 *
+	 * @global wpdb $wpdb WordPress database abstraction object.
+	 */
+	public function test_a_failed_record_read_is_wp_error_not_null(): void {
+		global $wpdb;
+
+		wp_set_secret( 'myplugin/api-key', 'value' );
+		wp_cache_delete( '_wp_secret_myplugin/api-key', 'options' );
+
+		$suppress = $wpdb->suppress_errors( true );
+		add_filter( 'query', array( $this, 'fail_reads_of_the_api_key_record' ) );
+
+		$result = wp_get_secret( 'myplugin/api-key' );
+
+		remove_filter( 'query', array( $this, 'fail_reads_of_the_api_key_record' ) );
+		$wpdb->suppress_errors( $suppress );
+
+		$this->assertNotNull( $result );
+		$this->assertWPError( $result );
+		$this->assertSame( WP_SECRETS_ERROR_STORE_UNAVAILABLE, $result->get_error_code() );
+	}
+
+	/**
+	 * A write during a failed read must not treat the secret as new, which would
+	 * drop the version a rotation in progress still depends on.
+	 *
+	 * @ticket 66424
+	 *
+	 * @global wpdb $wpdb WordPress database abstraction object.
+	 */
+	public function test_a_failed_record_read_does_not_let_a_write_report_success(): void {
+		global $wpdb;
+
+		wp_set_secret( 'myplugin/api-key', 'one' );
+		wp_set_secret( 'myplugin/api-key', 'two' );
+		wp_cache_delete( '_wp_secret_myplugin/api-key', 'options' );
+
+		$suppress = $wpdb->suppress_errors( true );
+		add_filter( 'query', array( $this, 'fail_reads_of_the_api_key_record' ) );
+
+		$written = wp_set_secret( 'myplugin/api-key', 'three' );
+
+		remove_filter( 'query', array( $this, 'fail_reads_of_the_api_key_record' ) );
+		$wpdb->suppress_errors( $suppress );
+
+		$this->assertWPError( $written );
+		$this->assertSame( WP_SECRETS_ERROR_STORE_UNAVAILABLE, $written->get_error_code() );
+
+		$current  = wp_get_secret( 'myplugin/api-key' );
+		$previous = wp_get_secret( 'myplugin/api-key', WP_Secret_Version::PREVIOUS );
+
+		$this->assertInstanceOf( WP_Secret::class, $current );
+		$this->assertSame( 'two', $current->reveal() );
+		$this->assertInstanceOf( WP_Secret::class, $previous );
+		$this->assertSame( 'one', $previous->reveal() );
+	}
+
+	/**
+	 * Makes every read of this test's own secret record fail.
+	 *
+	 * @param string $query The query about to run.
+	 * @return string The query to run instead.
+	 */
+	public function fail_reads_of_the_api_key_record( $query ) {
+		if ( 0 === stripos( $query, 'SELECT' ) && false !== strpos( $query, '_wp_secret_myplugin/api-key' ) ) {
+			return 'SELECT this is not valid SQL';
+		}
+
+		return $query;
+	}
 }

@@ -74,6 +74,129 @@ class Tests_Secrets_WPSecretsOptionStore extends WP_UnitTestCase {
 		$this->assertSame( WP_SECRETS_ERROR_RECORD_MALFORMED, $result->get_error_code() );
 	}
 
+	/**
+	 * @ticket 66424
+	 *
+	 * @global wpdb $wpdb WordPress database abstraction object.
+	 */
+	public function test_get_returns_an_error_when_the_record_read_fails(): void {
+		global $wpdb;
+
+		$store = new WP_Secrets_Option_Store();
+		$store->set( 'myplugin/key', $this->sample_record() );
+		wp_cache_delete( '_wp_secret_myplugin/key', 'options' );
+
+		$suppress = $wpdb->suppress_errors( true );
+		add_filter( 'query', array( $this, 'fail_option_reads' ) );
+
+		$result = $store->get( 'myplugin/key' );
+
+		remove_filter( 'query', array( $this, 'fail_option_reads' ) );
+		$wpdb->suppress_errors( $suppress );
+
+		$this->assertNotNull( $result, 'A failed read must not read as a missing secret.' );
+		$this->assertWPError( $result );
+		$this->assertSame( WP_SECRETS_ERROR_STORE_UNAVAILABLE, $result->get_error_code() );
+	}
+
+	/**
+	 * @ticket 66424
+	 *
+	 * @global wpdb $wpdb WordPress database abstraction object.
+	 */
+	public function test_get_returns_an_error_when_a_network_record_read_fails(): void {
+		global $wpdb;
+
+		$store = new WP_Secrets_Option_Store();
+		$store->set( 'myplugin/key', $this->sample_record(), true );
+		wp_cache_flush();
+
+		$suppress = $wpdb->suppress_errors( true );
+		add_filter( 'query', array( $this, 'fail_option_reads' ) );
+
+		$result = $store->get( 'myplugin/key', true );
+
+		remove_filter( 'query', array( $this, 'fail_option_reads' ) );
+		$wpdb->suppress_errors( $suppress );
+
+		$this->assertNotNull( $result, 'A failed read must not read as a missing secret.' );
+		$this->assertWPError( $result );
+		$this->assertSame( WP_SECRETS_ERROR_STORE_UNAVAILABLE, $result->get_error_code() );
+	}
+
+	/**
+	 * A read that never reaches the database returns from wpdb::query() before
+	 * wpdb::$last_error is set, so failure has to be read from the query result.
+	 *
+	 * @ticket 66424
+	 *
+	 * @global wpdb $wpdb WordPress database abstraction object.
+	 */
+	public function test_get_returns_an_error_when_the_read_never_reaches_the_database(): void {
+		global $wpdb;
+
+		$store = new WP_Secrets_Option_Store();
+		$store->set( 'myplugin/key', $this->sample_record() );
+		wp_cache_delete( '_wp_secret_myplugin/key', 'options' );
+
+		$wpdb->last_error = '';
+		$wpdb->ready      = false;
+
+		$result = $store->get( 'myplugin/key' );
+
+		$wpdb->ready = true;
+
+		$this->assertNotNull( $result, 'A read that never reached the database must not read as a missing secret.' );
+		$this->assertWPError( $result );
+		$this->assertSame( WP_SECRETS_ERROR_STORE_UNAVAILABLE, $result->get_error_code() );
+	}
+
+	/**
+	 * wp_sitemeta.meta_value is nullable, unlike wp_options.option_value, so a row
+	 * can exist while holding no record. That is a malformed record, not absence.
+	 *
+	 * @ticket 66424
+	 *
+	 * @group ms-required
+	 *
+	 * @global wpdb $wpdb WordPress database abstraction object.
+	 */
+	public function test_get_returns_an_error_for_a_network_row_with_no_value(): void {
+		global $wpdb;
+
+		$wpdb->insert(
+			$wpdb->sitemeta,
+			array(
+				'site_id'    => get_current_network_id(),
+				'meta_key'   => '_wp_network_secret_myplugin/key',
+				'meta_value' => null,
+			)
+		);
+		wp_cache_flush();
+
+		$store = new WP_Secrets_Option_Store();
+
+		$result = $store->get( 'myplugin/key', true );
+
+		$this->assertNotNull( $result, 'A row that exists must not read as a missing secret.' );
+		$this->assertWPError( $result );
+		$this->assertSame( WP_SECRETS_ERROR_RECORD_MALFORMED, $result->get_error_code() );
+	}
+
+	/**
+	 * Makes every read of a stored option or network option fail.
+	 *
+	 * @param string $query The query about to run.
+	 * @return string The query to run instead.
+	 */
+	public function fail_option_reads( $query ) {
+		if ( 0 === stripos( $query, 'SELECT' ) && ( false !== stripos( $query, 'option_value' ) || false !== stripos( $query, 'meta_value' ) ) ) {
+			return 'SELECT this is not valid SQL';
+		}
+
+		return $query;
+	}
+
 	public function test_delete_removes_an_existing_record(): void {
 		$store = new WP_Secrets_Option_Store();
 		$store->set( 'myplugin/key', $this->sample_record() );
